@@ -1,0 +1,9 @@
+{
+  "n": 100,
+  "seed": 7,
+  "generator": "agentaudit.dataset.build_corpus",
+  "corpus_sha256": "a1f44b3e2f089a3f0ab9a447bb4e2ea634ac822c10aa75383c338ad4c0000604",
+  "truth_sha256": "4eabf560d29dc6831d358fb0a0061b4ccd05fabd4e9d5e96d1b1e93c7c3fb979",
+  "schema": "invoice",
+  "note": "Synthetic. Regenerate with `python -m agentaudit.corpus export`. Hashes are checked by tests to catch generator drift."
+}
