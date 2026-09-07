@@ -149,12 +149,17 @@ class SelfCorrectingAgent:
             record = completion.as_json()
         except json.JSONDecodeError:
             record = {}
-            span.finish(SpanStatus.ERROR, error="model returned unparseable JSON")
+            span.finish(
+                SpanStatus.ERROR,
+                error="model returned unparseable JSON",
+                stop_reason=completion.stop_reason,
+            )
             trace.pop()
             return record
         span.finish(
             SpanStatus.OK,
             output_tokens=completion.output_tokens,
+            stop_reason=completion.stop_reason,
             fields=sorted(record),
         )
         trace.pop()
