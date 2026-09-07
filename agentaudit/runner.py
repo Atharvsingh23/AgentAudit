@@ -45,7 +45,7 @@ def standard_conditions(seed: int = 0, rate: float = 0.85) -> list[Condition]:
         keys = tuple(k for k, s in TAXONOMY.items() if s.layer is layer)
         conditions.append(
             Condition(
-                f"{layer.value}",
+                layer.value,
                 InjectionPlan(rate=rate, faults=keys, seed=seed, max_per_run=1),
             )
         )
@@ -58,15 +58,17 @@ class ExperimentResult:
     traces: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"reports": [r.to_dict() for r in self.reports]}
+        return {
+            "reports": [r.to_dict() for r in self.reports],
+            "traces": self.traces,
+        }
 
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(
-            {"reports": [r.to_dict() for r in self.reports], "traces": self.traces},
-            indent=2, default=str,
-        ))
+        path.write_text(
+            json.dumps(self.to_dict(), indent=2, default=str) + "\n"
+        )
         return path
 
 
@@ -116,12 +118,13 @@ class Experiment:
                 result = agent.run(document)
                 truth = document["truth"]
 
+                rescued: set[str] = set()
                 if judge is not None and result.succeeded:
                     rescued = judge.adjudicate(result.record, truth, result.trace)
-                    for name in rescued:
-                        result.record[name] = truth[name]
 
-                report.runs.append(score_run(result, truth, self.schema))
+                report.runs.append(
+                    score_run(result, truth, self.schema, rescued=rescued)
+                )
 
                 if len(kept) < self.keep_traces and result.trace.faults_injected:
                     kept.append(result.trace.to_dict())
@@ -130,6 +133,24 @@ class Experiment:
             outcome.traces[condition.name] = kept
 
         return outcome
+
+
+def by_fault_conditions(seed: int = 0, rate: float = 1.0) -> list[Condition]:
+    """One condition per fault, named `<detectability>:<fault>`.
+
+    The layer-level table pools faults that behave nothing alike — a
+    dropped field and a plausible substitution are both "one fault" but
+    only one of them is catchable without re-reading the source. This is
+    the same argument the module makes against pooling *layers*, applied
+    one level further down.
+    """
+    return [
+        Condition(
+            f"{fault.detectability.value[:5]}:{key}",
+            InjectionPlan(rate=rate, faults=(key,), seed=seed, max_per_run=1),
+        )
+        for key, fault in TAXONOMY.items()
+    ]
 
 
 def ablation_conditions(seed: int = 0, rate: float = 0.85) -> list[Condition]:

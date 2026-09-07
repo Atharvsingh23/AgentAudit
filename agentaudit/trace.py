@@ -106,9 +106,29 @@ class Trace:
     def correction_spans(self) -> list[Span]:
         return [s for s in self.spans if s.kind is SpanKind.CORRECTION]
 
+    def retry_spans(self) -> list[Span]:
+        """Corrections that are just a transport call being retried."""
+        return [s for s in self.correction_spans()
+                if s.attributes.get("retry") is True]
+
+    def repair_spans(self) -> list[Span]:
+        """Corrections triggered by something wrong with a *value*.
+
+        Retrying a timeout is recovery, but it is not evidence the agent
+        noticed a corrupted number — keeping the two apart is what stops a
+        retry in one tool from being scored as detection of an unrelated
+        semantic fault.
+        """
+        return [s for s in self.correction_spans()
+                if s.attributes.get("retry") is not True]
+
     @property
     def correction_attempts(self) -> int:
         return len(self.correction_spans())
+
+    @property
+    def repair_attempts(self) -> int:
+        return len(self.repair_spans())
 
     @property
     def faults_injected(self) -> int:

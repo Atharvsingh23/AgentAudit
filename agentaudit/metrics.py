@@ -90,7 +90,16 @@ def score_run(
     result: ExtractionResult,
     truth: dict[str, Any],
     schema: Schema,
+    rescued: set[str] | None = None,
 ) -> RunScore:
+    """Score one run against ground truth.
+
+    ``rescued`` names fields an LLM judge accepted as equivalent despite
+    exact match failing. They are credited here rather than by writing the
+    reference value into ``result.record`` — ground truth must never end up
+    inside the agent's own output, where the next stage would read it back.
+    """
+    rescued = rescued or set()
     scores: list[FieldScore] = []
     for f in schema.fields:
         if f.name not in truth:
@@ -99,7 +108,7 @@ def score_run(
         scores.append(
             FieldScore(
                 name=f.name,
-                correct=f.matches(predicted, truth[f.name]),
+                correct=f.name in rescued or f.matches(predicted, truth[f.name]),
                 predicted=predicted,
                 expected=truth[f.name],
                 weight=f.criticality.weight,
@@ -119,9 +128,12 @@ def score_run(
     detected = sum(1 for s in corrupting if s.span_id in detected_ids)
 
     # A correction triggered while a corrupting fault is live counts as
-    # detection even if span attribution is coarse.
-    if corrupting and not detected and trace.correction_attempts > 0:
-        detected = min(len(corrupting), trace.correction_attempts)
+    # detection even if span attribution is coarse. Retries are excluded:
+    # a retried timeout says nothing about whether the agent noticed a
+    # transposed digit somewhere else in the same run, and counting it as
+    # detection credits the agent for a fault it never saw.
+    if corrupting and not detected and trace.repair_attempts > 0:
+        detected = min(len(corrupting), trace.repair_attempts)
 
     return RunScore(
         document_id=result.document_id,
@@ -244,9 +256,13 @@ def format_table(reports: list[Report]) -> str:
             text = f"{value:.3f}"
         else:
             text = str(value)
+        if len(text) >= width:
+            # Truncate rather than overflow: a long condition name pushing
+            # a row out of alignment makes the whole table unreadable.
+            text = text[: width - 2] + "…"
         return text.ljust(width)
 
-    lines = ["".join(h.ljust(w) for h, w in zip(headers, widths))]
+    lines = ["".join(h.ljust(w) for h, w in zip(headers, widths, strict=True))]
     lines.append("-" * sum(widths))
     for rep in reports:
         row = [
@@ -254,5 +270,5 @@ def format_table(reports: list[Report]) -> str:
             _r(rep.detection_rate), _r(rep.recovery_rate),
             _r(rep.silent_failure_rate), round(rep.correction_overhead, 2),
         ]
-        lines.append("".join(cell(v, w) for v, w in zip(row, widths)))
+        lines.append("".join(cell(v, w) for v, w in zip(row, widths, strict=True)))
     return "\n".join(lines)

@@ -10,7 +10,7 @@ Runs end to end with **no API key and no spend**.
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                 # 27 tests, no network
+pytest -q                 # no network, no API key
 agentaudit bench --n 100
 ```
 
@@ -36,25 +36,49 @@ Only the last row hurts you in production, and accuracy-only reporting hides it 
 
 ## Results
 
-Mock provider, n=100 synthetic invoices, one fault per run, `seed=0`. Reproduce with `agentaudit bench --n 100`.
+Mock provider, n=100 synthetic invoices, at most one fault per run, `rate=0.85`, `seed=0`. Reproduce with `agentaudit bench --n 100`.
 
 ```
 condition                 n    exact  field  detect recover silent corr
 -------------------------------------------------------------------------
 clean                     100  1.000  1.000  —      —       —      0.000
 transport                 100  1.000  1.000  —      —       —      0.000
-structural                100  0.600  0.931  0.640  0.600   0.070  0.970
-semantic                  100  0.770  0.974  0.190  0.770   0.150  0.270
-contextual                100  0.210  0.822  0.790  0.210   0.200  0.970
+structural                100  0.700  0.967  0.930  0.700   0.070  0.930
+semantic                  100  0.430  0.937  0.812  0.406   0.188  1.220
+contextual                100  0.270  0.837  0.800  0.270   0.200  0.930
 ```
 
-Three things worth reading off this table:
+Two things worth reading off this table:
 
 **Retries fully absorb transport faults.** Timeouts and rate limits cost latency, nothing else. This is the failure mode everyone builds for, and it's the one that matters least.
 
-**Field accuracy is actively misleading.** The `semantic` row has the *highest* field accuracy of any faulted condition (0.974) and the second-highest silent failure rate (0.150). One corrupted field out of nine barely moves an average, but it's still a wrong invoice total. Any metric that averages over fields will tell you this pipeline is fine.
+**Field accuracy is actively misleading.** The `semantic` row keeps 0.937 field accuracy while only 43% of records are correct and 19% of faulted runs are wrong with nothing flagged. One corrupted field out of nine barely moves an average, but it's still a wrong invoice total. Any metric that averages over fields will tell you this pipeline is fine.
 
-**Detection collapses exactly where it matters.** Structural faults are caught 64% of the time; semantic faults, 19%. A JSON parser catches the first class for free. Nothing catches the second unless you build something that specifically goes looking.
+### Per fault, because layers pool things that behave nothing alike
+
+`agentaudit bench --n 100 --by-fault` — same defaults as above, at most one fault per run:
+
+```
+condition                 n    exact  field  detect recover silent corr
+-------------------------------------------------------------------------
+mecha:timeout             100  1.000  1.000  —      —       —      0.000
+mecha:rate_limit          100  1.000  1.000  —      —       —      0.000
+mecha:transient_error     100  1.000  1.000  —      —       —      0.000
+mecha:malformed_json      100  0.150  0.906  1.000  0.150   0.000  1.000
+mecha:schema_drift        100  1.000  1.000  1.000  1.000   0.000  1.000
+mecha:type_violation      100  1.000  1.000  1.000  1.000   0.000  1.000
+mecha:field_dropped       100  0.710  0.968  0.710  0.710   0.290  0.710
+consi:digit_transposition 100  0.260  0.918  0.865  0.229   0.135  1.500
+consi:magnitude_shift     100  0.290  0.921  0.929  0.276   0.071  1.580
+consi:unit_mismatch       100  1.000  1.000  1.000  1.000   0.000  1.000
+corro:plausible_substitu… 100  0.320  0.924  0.515  0.313   0.485  0.720
+corro:stale_cache         100  0.140  0.728  0.980  0.131   0.020  0.980
+opaqu:cross_document_ble… 100  0.300  0.922  0.520  0.300   0.480  0.740
+```
+
+Silent failure tracks detectability, which is the whole argument for classifying faults that way: everything mechanical lands at or near zero, and the two faults that need evidence from outside the response — `plausible_substitution` and `cross_document_bleed` — fail silently on roughly half of the runs they touch.
+
+The exception is instructive. `field_dropped` is mechanically detectable yet fails silently 29% of the time, because a dropped *optional* field raises no validation error, so nothing ever goes looking for it. Detectable in principle is not the same as detected.
 
 ### Ablation: does corroboration help?
 
@@ -62,10 +86,10 @@ Re-deriving critical fields from the source document, at the cost of an extra to
 
 | corroboration | detection | silent failure |
 |---|---|---|
-| **on** | 0.360 | **0.210** |
-| off | 0.130 | 0.440 |
+| **on** | 0.773 | **0.227** |
+| off | 0.381 | 0.619 |
 
-Silent failures **more than double** when the agent trusts its tools instead of re-checking them. This is asserted as a test (`test_corroboration_reduces_silent_failures`), so it fails CI if it ever stops holding.
+Silent failures **nearly triple** when the agent trusts its tools instead of re-checking them. This is asserted as a test (`test_corroboration_reduces_silent_failures`), so it fails CI if it ever stops holding.
 
 > **On the mock provider.** These numbers come from a deterministic rule-based stand-in, not a real model. That's deliberate — it's a control. Because the mock's behaviour is fixed, any change in the numbers between two runs is a harness bug rather than model variance. Absolute values here are *not* claims about GPT-4 or Claude; the fault taxonomy and the relative ordering between conditions are. Run `--provider anthropic` for real numbers.
 
@@ -94,7 +118,8 @@ The `plausible_substitution` fault is the one to care about: it swaps a value fo
 ## Usage
 
 ```bash
-agentaudit bench --n 100                    # all conditions
+agentaudit bench --n 100                     # all conditions, one per layer
+agentaudit bench --n 100 --by-fault          # one condition per fault
 agentaudit bench --ablation --no-corroborate # isolate one defence
 agentaudit bench --provider anthropic        # real model (needs ANTHROPIC_API_KEY)
 agentaudit faults                            # print the taxonomy
@@ -189,7 +214,7 @@ registry = ToolRegistry([MyTool()], injector=FaultInjector(
 Worth stating plainly, since they bound what the numbers mean:
 
 - **Synthetic corpus.** Documents are cleaner than real scans, so absolute accuracy is optimistic. Comparisons *between* conditions — the point of the harness — are unaffected.
-- **Detection attribution is coarse.** Every prior successful tool call is treated as a suspect for a given problem. Precise attribution would need ground truth, which the agent must not have.
+- **Detection attribution is coarse.** Every prior successful tool call is treated as a suspect for a given problem, so with more than one fault in a run, detecting one credits the others. Precise attribution would need ground truth, which the agent must not have. Transport retries are excluded — recovering from a timeout is not evidence of noticing a corrupted number — but within a run the remaining attribution is deliberately generous, which makes `detect` an upper bound and `silent` a lower one.
 - **One task.** Invoice extraction only. The taxonomy generalizes; the tools and schema don't yet.
 - **The mock is not a model.** See the note under Results.
 
@@ -205,7 +230,8 @@ Worth stating plainly, since they bound what the numbers mean:
 ```
 benchmarks/invoices/      100 documents, ground truth, SHA-256 manifest
 results/                  pre-computed JSON for every table in this README
-tests/                    27 tests, no network, ~0.2s
+                          (standard, by_fault, ablation_on, ablation_off)
+tests/                    unit + regression suite, no network
 examples/                 worked silent-failure walkthrough
 .github/workflows/ci.yml  tests on 3.10–3.12 + cross-run reproducibility check
 ```
@@ -219,7 +245,7 @@ drift, so results can't silently stop matching their data.
 
 ```bash
 make install       # pip install -e ".[dev]"
-make test          # 27 tests, ~0.2s, no network
+make test          # no network, well under a second
 make bench         # headline table
 make ablation      # corroboration on vs off
 make results       # regenerate results/*.json

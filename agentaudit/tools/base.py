@@ -11,7 +11,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ..faults.injector import FaultInjector, ToolFailure
+from ..faults.injector import FaultContext, FaultInjector, ToolFailure
 from ..trace import SpanKind, SpanStatus, Trace
 
 
@@ -61,6 +61,7 @@ class ToolRegistry:
             raise KeyError(f"unknown tool {name!r}")
 
         tool = self._tools[name]
+        document_id = document.get("document_id", "")
         attempt = 0
 
         while True:
@@ -70,26 +71,32 @@ class ToolRegistry:
                 attempt=attempt, call_index=self._call_index,
             )
             trace.push(span)
+            finished = False
             try:
                 payload = tool.run(document, **kwargs)
+                # What the tool really returned. `apply` corrupts a copy, so
+                # this reference stays clean even when a fault lands.
+                uncorrupted = payload
 
-                fault = (
-                    self.injector.decide(name, self._call_index)
-                    if self.injector else None
-                )
+                fault = self.injector.decide(name) if self.injector else None
                 if fault is not None:
-                    span.fault_injected = fault.key
                     try:
-                        payload, detail = self.injector.apply(
-                            fault, payload, document.get("document_id", "")
+                        payload, detail, applied = self.injector.apply(
+                            fault, payload, FaultContext(document_id, name),
                         )
-                        span.fault_detail = detail
+                        # A handler that found nothing to corrupt leaves the
+                        # span unmarked — see FaultInjector.apply.
+                        if applied:
+                            span.fault_injected = fault.key
+                            span.fault_detail = detail
                     except ToolFailure as failure:
+                        span.fault_injected = fault.key
                         span.fault_detail = {
                             "message": str(failure),
                             "retryable": failure.retryable,
                         }
                         span.finish(SpanStatus.ERROR, error=str(failure))
+                        finished = True
                         trace.pop()
 
                         if attempt < max_retries and failure.retryable:
@@ -97,19 +104,30 @@ class ToolRegistry:
                                 f"retry:{name}", SpanKind.CORRECTION,
                                 triggered_by=[span.span_id],
                                 reason=f"transport fault: {failure.fault_key}",
+                                # Marked so the metrics layer can tell a
+                                # transport retry apart from noticing a
+                                # corrupted value — see Trace.repair_spans.
+                                retry=True,
                             )
                             recovery.finish()
                             attempt += 1
                             continue
                         raise
 
+                if self.injector is not None:
+                    self.injector.observe(name, document_id, uncorrupted)
+
                 span.finish(SpanStatus.OK, keys=sorted(payload))
+                finished = True
                 trace.pop()
                 return payload
 
-            except ToolFailure:
-                raise
             except Exception as exc:
-                span.finish(SpanStatus.ERROR, error=repr(exc))
-                trace.pop()
+                # ToolFailure raised out of the block above has already been
+                # recorded; anything else (including a tool raising one
+                # itself) still needs its span closed, or every later span
+                # is parented to a call that never ended.
+                if not finished:
+                    span.finish(SpanStatus.ERROR, error=repr(exc))
+                    trace.pop()
                 raise
