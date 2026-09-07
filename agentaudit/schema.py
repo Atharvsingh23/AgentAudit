@@ -156,6 +156,44 @@ class Schema:
         if len(names) != len(set(names)):
             raise ValueError("duplicate field names in schema")
 
+    @classmethod
+    def from_spec(cls, spec: dict[str, Any], name: str = "schema") -> Schema:
+        """Build a schema from plain data, for auditing your own pipeline.
+
+        ``{"total": {"type": "money", "criticality": "critical"}}`` — the
+        value may also be a bare type name. Everything but ``type`` is
+        optional, so the shortest useful form is
+        ``{"total": "money", "vendor": "string"}``.
+
+        Criticality is worth setting even though it defaults: it is what
+        stops a wrong vendor name and a wrong invoice total from counting
+        the same, which is most of the point of scoring per field.
+        """
+        fields: list[Field] = []
+        for field_name, raw in spec.items():
+            options = {"type": raw} if isinstance(raw, str) else dict(raw)
+            try:
+                field_type = FieldType(options.pop("type"))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"{field_name}: type must be one of "
+                    f"{[t.value for t in FieldType]}"
+                ) from exc
+            criticality = Criticality(options.pop("criticality", "standard"))
+            choices = tuple(options.pop("choices", ()))
+            unknown = set(options) - {"required", "description"}
+            if unknown:
+                raise ValueError(f"{field_name}: unknown option(s) {sorted(unknown)}")
+            fields.append(Field(
+                name=field_name,
+                type=field_type,
+                criticality=criticality,
+                required=bool(options.pop("required", True)),
+                choices=choices,
+                description=str(options.pop("description", "")),
+            ))
+        return cls(name=name, fields=tuple(fields))
+
     def get(self, name: str) -> Field | None:
         for f in self.fields:
             if f.name == name:
