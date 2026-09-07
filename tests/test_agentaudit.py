@@ -18,6 +18,7 @@ from agentaudit import (
     score_run,
 )
 from agentaudit.faults.taxonomy import TAXONOMY, Detectability, FaultLayer
+from agentaudit.cli import DONOR_POOL, _documents, build_parser
 from agentaudit.schema import Field, FieldType, totals_add_up
 
 
@@ -251,6 +252,38 @@ def test_corroboration_reduces_silent_failures():
         return experiment.run(condition).reports[0].silent_failure_rate
 
     assert silent_rate(True) < silent_rate(False)
+
+
+# -- cli and packaging ----------------------------------------------------
+
+def test_unknown_fault_name_is_rejected_at_the_command_line():
+    """It used to reach the injector and die on a KeyError deep inside."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["trace", "--faults", "not_a_fault"])
+    args = parser.parse_args(["trace", "--faults", "plausible_substitution"])
+    assert args.faults == ["plausible_substitution"]
+
+
+def test_donor_pool_is_wider_than_the_run_being_traced():
+    """`trace --n 1` built its donor pool from the single document it ran,
+    so every fault that needs another document to steal from did nothing."""
+    args = build_parser().parse_args(["trace", "--n", "1"])
+    assert len(_documents(args)) == 1
+    assert len(_documents(args, limit=DONOR_POOL)) == DONOR_POOL
+
+
+def test_version_is_single_sourced():
+    from agentaudit import __version__
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--version"])
+    assert __version__
+
+
+def test_corpus_load_reports_a_missing_file_usefully(tmp_path):
+    from agentaudit import load_corpus
+    with pytest.raises(FileNotFoundError, match="corpus export"):
+        load_corpus(tmp_path)
 
 
 # -- shipped corpus -------------------------------------------------------

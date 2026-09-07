@@ -31,6 +31,35 @@ def _digest(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
+def _split(
+    documents: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate documents from their ground truth.
+
+    Export and verification must shape the records identically or the
+    manifest hashes compare two different things and the drift check
+    passes on files it has never actually validated.
+    """
+    corpus = [
+        {
+            "document_id": d["document_id"],
+            "raw_text": d["raw_text"],
+            "fields": d["fields"],
+        }
+        for d in documents
+    ]
+    truth = [
+        {"document_id": d["document_id"], "truth": d["truth"]} for d in documents
+    ]
+    return corpus, truth
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
+
+
 def export_corpus(
     n: int = 100,
     seed: int = 7,
@@ -40,18 +69,7 @@ def export_corpus(
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     documents = build_corpus(n=n, seed=seed)
-
-    corpus_records = [
-        {
-            "document_id": d["document_id"],
-            "raw_text": d["raw_text"],
-            "fields": d["fields"],
-        }
-        for d in documents
-    ]
-    truth_records = [
-        {"document_id": d["document_id"], "truth": d["truth"]} for d in documents
-    ]
+    corpus_records, truth_records = _split(documents)
 
     with (directory / CORPUS_FILE).open("w") as fh:
         for record in corpus_records:
@@ -80,42 +98,41 @@ def export_corpus(
 def load_corpus(directory: str | Path = DEFAULT_DIR) -> list[dict[str, Any]]:
     """Load the shipped corpus from disk, rejoined with ground truth."""
     directory = Path(directory)
-    corpus_path = directory / CORPUS_FILE
-    truth_path = directory / TRUTH_FILE
-    if not corpus_path.exists():
-        raise FileNotFoundError(
-            f"{corpus_path} not found; run `python -m agentaudit.corpus export`"
-        )
+    for path in (directory / CORPUS_FILE, directory / TRUTH_FILE):
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} not found; run `python -m agentaudit.corpus export`"
+            )
 
     truth_by_id = {
-        json.loads(line)["document_id"]: json.loads(line)["truth"]
-        for line in truth_path.read_text().splitlines() if line.strip()
+        record["document_id"]: record["truth"]
+        for record in _read_jsonl(directory / TRUTH_FILE)
     }
 
-    documents = []
-    for line in corpus_path.read_text().splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        record["truth"] = truth_by_id[record["document_id"]]
-        documents.append(record)
+    documents = _read_jsonl(directory / CORPUS_FILE)
+    for record in documents:
+        try:
+            record["truth"] = truth_by_id[record["document_id"]]
+        except KeyError:
+            raise ValueError(
+                f"{record['document_id']} has no ground truth in {TRUTH_FILE}; "
+                "the two files are out of sync — re-export the corpus"
+            ) from None
     return documents
 
 
 def verify_corpus(directory: str | Path = DEFAULT_DIR) -> bool:
     """Check the shipped files still match what the generator produces."""
     directory = Path(directory)
-    manifest = json.loads((directory / MANIFEST_FILE).read_text())
-    documents = build_corpus(n=manifest["n"], seed=manifest["seed"])
-
-    corpus_records = [
-        {"document_id": d["document_id"], "raw_text": d["raw_text"],
-         "fields": d["fields"]}
-        for d in documents
-    ]
-    truth_records = [
-        {"document_id": d["document_id"], "truth": d["truth"]} for d in documents
-    ]
+    manifest_path = directory / MANIFEST_FILE
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"{manifest_path} not found; run `python -m agentaudit.corpus export`"
+        )
+    manifest = json.loads(manifest_path.read_text())
+    corpus_records, truth_records = _split(
+        build_corpus(n=manifest["n"], seed=manifest["seed"])
+    )
     return (
         _digest(corpus_records) == manifest["corpus_sha256"]
         and _digest(truth_records) == manifest["truth_sha256"]
