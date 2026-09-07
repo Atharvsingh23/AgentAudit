@@ -19,6 +19,10 @@ class Completion:
     input_tokens: int = 0
     output_tokens: int = 0
     model: str = ""
+    # Why generation stopped, verbatim from the provider ("" if unknown).
+    # `max_tokens` here means a truncated record, which must be visible in
+    # the trace rather than scored as if the model got the answer wrong.
+    stop_reason: str = ""
 
     def as_json(self) -> dict[str, Any]:
         """Parse a JSON object out of the response, tolerating code fences."""
@@ -40,7 +44,13 @@ class Provider(ABC):
         prompt: str,
         *,
         system: str = "",
-        max_tokens: int = 1024,
-        temperature: float = 0.0,
+        max_tokens: int = 16000,
+        temperature: float | None = None,
     ) -> Completion:
-        ...
+        """Return one completion.
+
+        ``temperature`` defaults to None — "whatever the provider does" —
+        rather than 0.0, because current Anthropic models reject the
+        parameter entirely. Determinism in this harness comes from the
+        seeded injector and the mock provider, not from sampling settings.
+        """

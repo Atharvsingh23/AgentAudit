@@ -7,7 +7,9 @@ breaks, nothing else is meaningful.
 
 from __future__ import annotations
 
+import sys
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -178,6 +180,81 @@ def test_agent_never_reads_injected_fault_labels():
     for key in TAXONOMY:
         assert key not in blob, f"fault label {key!r} leaked into a prompt"
     assert "fault_injected" not in blob
+
+
+# -- providers ------------------------------------------------------------
+
+class _StubResponse:
+    def __init__(self, text, stop_reason="end_turn"):
+        self.content = [SimpleNamespace(type="thinking", thinking="..."),
+                        SimpleNamespace(type="text", text=text)]
+        self.usage = SimpleNamespace(input_tokens=11, output_tokens=22)
+        self.stop_reason = stop_reason
+
+
+def _stub_anthropic(monkeypatch, response):
+    """Install a fake `anthropic` module and capture the request kwargs."""
+    seen: dict = {}
+
+    class _Messages:
+        def create(self, **kwargs):
+            seen.update(kwargs)
+            return response
+
+    class _Anthropic:
+        def __init__(self, api_key=None):
+            self.messages = _Messages()
+
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=_Anthropic))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    return seen
+
+
+def test_anthropic_request_omits_temperature_by_default(monkeypatch):
+    """Current models reject `temperature` with a 400.
+
+    The harness never sets one — its determinism comes from the seeded
+    injector and the mock provider — so sending 0.0 on every call only
+    bought a failed request.
+    """
+    from agentaudit.providers.anthropic import DEFAULT_MODEL, AnthropicProvider
+
+    seen = _stub_anthropic(monkeypatch, _StubResponse('{"ok": true}'))
+    completion = AnthropicProvider().complete("prompt", system="sys")
+
+    assert "temperature" not in seen
+    assert seen["model"] == DEFAULT_MODEL
+    # thinking blocks must not leak into the extracted text
+    assert completion.text == '{"ok": true}'
+    assert completion.output_tokens == 22
+
+
+def test_anthropic_forwards_temperature_only_when_asked(monkeypatch):
+    from agentaudit.providers.anthropic import AnthropicProvider
+
+    seen = _stub_anthropic(monkeypatch, _StubResponse("{}"))
+    AnthropicProvider(model="claude-3-5-sonnet-20240620").complete("p", temperature=0.0)
+    assert seen["temperature"] == 0.0
+
+
+def test_truncated_completion_is_visible_on_the_trace():
+    """A record cut off at max_tokens is a fact about the run.
+
+    Without it on the span, truncation is indistinguishable from a model
+    that simply extracted badly.
+    """
+    class Truncating(MockProvider):
+        def complete(self, prompt, **kwargs):
+            completion = super().complete(prompt, **kwargs)
+            completion.stop_reason = "max_tokens"
+            return completion
+
+    doc = build_corpus(n=1, seed=7)[0]
+    registry = ToolRegistry(DEFAULT_TOOLS, injector=FaultInjector(InjectionPlan()))
+    agent = SelfCorrectingAgent(Truncating(), registry, INVOICE_SCHEMA, INVOICE_CHECKS)
+    trace = agent.run(doc).trace
+    assemble = [s for s in trace.spans if s.name == "assemble"]
+    assert assemble and assemble[0].attributes["stop_reason"] == "max_tokens"
 
 
 # -- metrics --------------------------------------------------------------

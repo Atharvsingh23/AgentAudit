@@ -41,8 +41,8 @@ class MockProvider(Provider):
         prompt: str,
         *,
         system: str = "",
-        max_tokens: int = 1024,
-        temperature: float = 0.0,
+        max_tokens: int = 16000,
+        temperature: float | None = None,
     ) -> Completion:
         self.calls += 1
 
