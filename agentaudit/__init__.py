@@ -1,5 +1,8 @@
 """AgentAudit — fault injection and reliability measurement for agent pipelines."""
 
+from .adapter import (
+    AuditResult, FunctionTool, audit_agent, quick_audit, wrap_tools,
+)
 from .agent import ExtractionResult, SelfCorrectingAgent
 from .corpus import export_corpus, load_corpus, verify_corpus
 from .dataset import build_corpus, corpus_for_injector
@@ -29,6 +32,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "SelfCorrectingAgent", "ExtractionResult",
+    "audit_agent", "quick_audit", "wrap_tools", "AuditResult", "FunctionTool",
     "InjectionPlan", "FaultInjector", "FaultContext", "ToolFailure", "NO_FAULTS",
     "TAXONOMY", "ALL_FAULTS", "FaultLayer", "Detectability", "FaultSpec",
     "Schema", "Field", "FieldType", "Criticality", "ConsistencyCheck",

@@ -34,6 +34,61 @@ Only the last row hurts you in production, and accuracy-only reporting hides it 
 
 **Silent failure rate is the metric this harness exists to produce.**
 
+## Audit your own pipeline
+
+The built-in agent exists so the harness can test itself. The point is to
+point it at **your** agent — which needs no knowledge of this library and
+no change to its control flow. You hand over your tool functions and get
+back functions with identical signatures that occasionally lie:
+
+```python
+from agentaudit import Schema, quick_audit
+
+def my_agent(document, tools):          # your control flow, unchanged
+    header = tools["fetch_header"](document["invoice_id"])
+    totals = tools["fetch_totals"](document["invoice_id"])
+    return {**header, **totals}
+
+result = quick_audit(
+    agent=my_agent,
+    tools={"fetch_header": fetch_header, "fetch_totals": fetch_totals},
+    documents=[{"document_id": "INV-1", "invoice_id": "INV-1",
+                "truth": {"total": "1100.00", ...}}, ...],
+    schema=Schema.from_spec({
+        "vendor": "string",
+        "total": {"type": "money", "criticality": "critical"},
+    }),
+)
+print(result.summary())
+```
+
+A pipeline that trusts its tools — which is most of them — scores like this:
+
+```
+condition                 n    exact  field  detect recover silent corr
+-------------------------------------------------------------------------
+clean                     30   1.000  1.000  —      —       —      0.000
+plausible_substitution    30   0.000  0.750  0.000  0.000   1.000  0.000
+```
+
+Field accuracy 0.750, silent failure **1.000**. Every run emitted a wrong
+invoice and flagged nothing.
+
+Outside an audit the wrapped tools are pass-throughs, so the same wiring
+serves production and the harness. `examples/audit_your_own_agent.py` is a
+complete worked version, and `audit_agent()` takes the full condition set
+when you want every fault layer rather than the one-minute check.
+
+Two deliberate choices worth knowing about:
+
+- **Transport faults are raised into your code, not retried for you.** If
+  your pipeline has no retry logic, that is a finding and it should look
+  like one. Pass `retry_transport_faults=True` only if something outside
+  the audited code genuinely retries in production.
+- **Tools that return something other than a mapping** can only be failed
+  at the transport layer, never quietly corrupted. The report names them
+  rather than letting their clean silent-failure number read as a pass.
+
 ## Results
 
 Mock provider, n=100 synthetic invoices, at most one fault per run, `rate=0.85`, `seed=0`. Reproduce with `agentaudit bench --n 100`.
@@ -177,6 +232,7 @@ print(format_table(result.reports))
 
 ```
 agentaudit/
+├── adapter.py           audit an agent this library did not write
 ├── schema.py            field types, criticality weights, consistency checks
 ├── trace.py             spans, fault bookkeeping, run records
 ├── faults/
@@ -232,7 +288,7 @@ benchmarks/invoices/      100 documents, ground truth, SHA-256 manifest
 results/                  pre-computed JSON for every table in this README
                           (standard, by_fault, ablation_on, ablation_off)
 tests/                    unit + regression suite, no network
-examples/                 worked silent-failure walkthrough
+examples/                 silent-failure walkthrough + auditing your own agent
 .github/workflows/ci.yml  tests on 3.10–3.12 + cross-run reproducibility check
 ```
 

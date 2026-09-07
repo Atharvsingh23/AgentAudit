@@ -114,7 +114,11 @@ class FaultInjector:
         ``begin_run``: a stale cache is stale precisely because it survives
         into the next document.
         """
-        self._last_served[tool_name] = (document_id, dict(payload))
+        # An external tool can return anything; only copy what is copyable
+        # as a mapping, and keep the rest by reference.
+        self._last_served[tool_name] = (
+            document_id, dict(payload) if isinstance(payload, dict) else payload,
+        )
 
     def _eligible(self, tool_name: str) -> bool:
         if self.plan.rate <= 0 or not self.plan.faults:
@@ -154,6 +158,15 @@ class FaultInjector:
         """
         if fault.layer is FaultLayer.TRANSPORT:
             self._raise_transport(fault)
+
+        if not isinstance(payload, dict):
+            # Every value-corrupting handler rewrites named fields, so it
+            # needs a mapping. A tool returning a scalar or a string can
+            # still be failed at the transport layer, but pretending to
+            # corrupt it would record a fault that never happened. Refund
+            # the budget so the plan can still land a real fault elsewhere.
+            self._injected_this_run -= 1
+            return payload, {}, False
 
         handler = getattr(self, f"_apply_{fault.key}", None)
         if handler is None:
@@ -303,6 +316,8 @@ class FaultInjector:
             return payload, {}
         served_for, stale = previous
         if served_for == ctx.document_id or stale == payload:
+            return payload, {}
+        if not isinstance(stale, dict):
             return payload, {}
         return dict(stale), {"served_for": served_for, "tool": ctx.tool_name}
 

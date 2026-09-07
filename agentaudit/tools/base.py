@@ -117,7 +117,13 @@ class ToolRegistry:
                 if self.injector is not None:
                     self.injector.observe(name, document_id, uncorrupted)
 
-                span.finish(SpanStatus.OK, keys=sorted(payload))
+                # An external tool can return anything; only a mapping has
+                # keys worth recording.
+                span.finish(
+                    SpanStatus.OK,
+                    keys=sorted(payload) if isinstance(payload, dict)
+                    else type(payload).__name__,
+                )
                 finished = True
                 trace.pop()
                 return payload
