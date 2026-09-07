@@ -12,6 +12,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["llm", "agents", "evaluation", "reliability", "fault-injection", "benchmark"]
+authors = [{ name = "Atharv Singh" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -23,6 +24,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Atharvsingh23/AgentAudit"
+Repository = "https://github.com/Atharvsingh23/AgentAudit"
+Issues = "https://github.com/Atharvsingh23/AgentAudit/issues"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
