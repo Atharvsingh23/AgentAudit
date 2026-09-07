@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentaudit"
-version = "0.1.0"
+# Single-sourced from agentaudit.__version__ so the package and the
+# `agentaudit --version` output cannot drift apart.
+dynamic = ["version"]
 description = "Fault injection and reliability measurement for LLM agent pipelines"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,8 +31,14 @@ dev = ["pytest>=7.4", "ruff>=0.5"]
 [project.scripts]
 agentaudit = "agentaudit.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "agentaudit.__version__" }
+
 [tool.setuptools.packages.find]
 include = ["agentaudit*"]
+
+[tool.setuptools.package-data]
+agentaudit = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -38,3 +46,10 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 90
 target-version = "py310"
+
+[tool.ruff.lint]
+# Ruff's documented default rule set, pinned. Without this the gate means
+# whatever the newest ruff happens to default to: `ruff>=0.5` resolved to
+# 0.16, whose defaults are far broader, and CI went red across every
+# branch with no code change behind it.
+select = ["E4", "E7", "E9", "F"]

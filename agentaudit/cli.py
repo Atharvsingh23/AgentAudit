@@ -1,7 +1,7 @@
 """Command-line interface for agentaudit benchmark.
 
-Version: 0.1.0 (research beta)
-Python: 3.10+
+Research beta. Python 3.10+. `agentaudit --version` prints the version;
+it is defined once, in ``agentaudit.__version__``.
 
 Examples:
     agentaudit bench --n 40 --provider mock
@@ -13,10 +13,10 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from typing import Any
 
+from . import __version__
 from .corpus import export_corpus, load_corpus, verify_corpus
 from .dataset import build_corpus, corpus_for_injector
 from .faults.injector import FaultInjector, InjectionPlan
@@ -25,6 +25,11 @@ from .metrics import format_table, score_run
 from .providers.mock import MockProvider
 from .runner import Experiment, ablation_conditions, standard_conditions
 from .schema import INVOICE_CHECKS, INVOICE_SCHEMA
+
+
+# Documents made available to donor-based faults when the run itself is
+# smaller than that — enough for a plausible substitution to find a victim.
+DONOR_POOL = 20
 
 
 def _provider_factory(name: str, vigilance: float):
@@ -36,20 +41,32 @@ def _provider_factory(name: str, vigilance: float):
     raise SystemExit(f"unknown provider {name!r}")
 
 
-def _documents(args: argparse.Namespace) -> list:
+def _documents(args: argparse.Namespace, limit: int | None = None) -> list:
     """Shipped corpus by default; regenerate only when asked.
 
     Reading the checked-in files by default means published numbers are
     reproducible against exact bytes rather than against a generator that
     might have drifted.
+
+    ``limit`` overrides ``--n``: donor-based faults need a pool of other
+    documents to steal plausible values from, and a pool the size of the
+    run (one document, for `trace --n 1`) leaves them nothing to do.
     """
+    n = args.n if limit is None else limit
     if getattr(args, "generate", False):
-        return build_corpus(n=args.n, seed=args.data_seed)
+        return build_corpus(n=n, seed=args.data_seed)
     try:
         documents = load_corpus()
     except FileNotFoundError:
-        return build_corpus(n=args.n, seed=args.data_seed)
-    return documents[: args.n]
+        return build_corpus(n=n, seed=args.data_seed)
+    if n > len(documents):
+        print(
+            f"note: shipped corpus holds {len(documents)} documents, "
+            f"{n} requested; running {len(documents)}. "
+            "Use --generate to synthesize more.",
+            file=sys.stderr,
+        )
+    return documents[:n]
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -110,9 +127,12 @@ def cmd_trace(args: argparse.Namespace) -> int:
     from .tools.extraction import DEFAULT_TOOLS
 
     documents = _documents(args)
+    # Donors come from a wider pool than the runs being rendered, so
+    # `trace --n 1` still exercises the faults that need another document.
+    donors = _documents(args, limit=max(args.n, DONOR_POOL))
     faults = tuple(args.faults) if args.faults else tuple(TAXONOMY)
     plan = InjectionPlan(rate=1.0, faults=faults, seed=args.seed, max_per_run=1)
-    injector = FaultInjector(plan, corpus=corpus_for_injector(documents))
+    injector = FaultInjector(plan, corpus=corpus_for_injector(donors))
     registry = ToolRegistry(DEFAULT_TOOLS, injector=injector)
     agent = SelfCorrectingAgent(
         MockProvider(vigilance=args.vigilance), registry,
@@ -147,6 +167,8 @@ def cmd_corpus(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentaudit")
+    parser.add_argument("--version", action="version",
+                        version=f"agentaudit {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     bench = sub.add_parser("bench", help="run the fault-injection benchmark")
@@ -176,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     trace = sub.add_parser("trace", help="render traces for individual runs")
     trace.add_argument("--n", type=int, default=1)
-    trace.add_argument("--faults", nargs="*", default=[])
+    trace.add_argument("--faults", nargs="*", default=[], choices=sorted(TAXONOMY),
+                       metavar="FAULT",
+                       help=f"one or more of: {', '.join(sorted(TAXONOMY))}")
     trace.add_argument("--seed", type=int, default=0)
     trace.add_argument("--data-seed", type=int, default=7)
     trace.add_argument("--vigilance", type=float, default=0.6)
