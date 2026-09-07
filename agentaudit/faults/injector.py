@@ -20,7 +20,7 @@ import json
 import random
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from .taxonomy import FaultLayer, FaultSpec, spec
@@ -253,7 +253,7 @@ class FaultInjector:
             shifted = Decimal(str(original).replace(",", "")) * self._rng.choice(
                 [Decimal("10"), Decimal("0.1")]
             )
-        except (InvalidOperation, ValueError):
+        except (ArithmeticError, ValueError):
             return payload, {}
         payload[victim] = str(shifted.quantize(Decimal("0.01")))
         return payload, {"field": victim, "original": original,
