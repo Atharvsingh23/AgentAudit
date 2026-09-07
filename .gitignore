@@ -7,5 +7,4 @@ dist/
 build/
 .pytest_cache/
 .ruff_cache/
-results/
 .DS_Store

@@ -35,6 +35,20 @@ class ToolFailure(RuntimeError):
         self.retryable = retryable
 
 
+@dataclass(frozen=True)
+class FaultContext:
+    """What a handler knows about the call it is corrupting.
+
+    Handlers get the tool name as well as the document id because a
+    contextual fault has to be specific about *which* stale or foreign
+    result it serves: returning some other tool's payload is a structural
+    fault wearing a contextual label, and it lands in the wrong bucket.
+    """
+
+    document_id: str
+    tool_name: str
+
+
 @dataclass
 class InjectionPlan:
     """Which faults to inject, and how often.
@@ -80,7 +94,9 @@ class FaultInjector:
         self.corpus = corpus or []
         self._injected_this_run = 0
         self._rng = random.Random()
-        self._last_payloads: list[dict[str, Any]] = []
+        # Last payload each tool returned, and for which document. Keyed by
+        # tool so `stale_cache` serves a previous result *of the same tool*.
+        self._last_served: dict[str, tuple[str, dict[str, Any]]] = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -91,6 +107,15 @@ class FaultInjector:
         self._rng = random.Random(int.from_bytes(digest[:8], "big"))
         self._injected_this_run = 0
 
+    def observe(self, tool_name: str, document_id: str, payload: dict[str, Any]) -> None:
+        """Record what a tool really returned, before any corruption.
+
+        Only `stale_cache` reads this. It is deliberately *not* cleared by
+        ``begin_run``: a stale cache is stale precisely because it survives
+        into the next document.
+        """
+        self._last_served[tool_name] = (document_id, dict(payload))
+
     def _eligible(self, tool_name: str) -> bool:
         if self.plan.rate <= 0 or not self.plan.faults:
             return False
@@ -100,7 +125,7 @@ class FaultInjector:
             return False
         return True
 
-    def decide(self, tool_name: str, call_index: int) -> FaultSpec | None:
+    def decide(self, tool_name: str) -> FaultSpec | None:
         if not self._eligible(tool_name):
             return None
         if self._rng.random() >= self.plan.rate:
@@ -114,9 +139,16 @@ class FaultInjector:
         self,
         fault: FaultSpec,
         payload: dict[str, Any],
-        document_id: str,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return (corrupted_payload, detail).
+        context: FaultContext,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Return (payload, detail, applied).
+
+        ``applied`` is False when the handler found nothing to corrupt —
+        no numeric field to shift, no donor document to steal from. Those
+        calls must not be recorded as faulted: a fault that changed nothing
+        would otherwise count as injected-and-missed, inflating the
+        denominator of every detection and silent-failure rate with runs
+        where there was nothing to detect.
 
         Raises ToolFailure for transport faults.
         """
@@ -127,9 +159,13 @@ class FaultInjector:
         if handler is None:
             raise NotImplementedError(f"no handler for fault {fault.key}")
 
-        corrupted, detail = handler(dict(payload), document_id)
-        self._last_payloads.append(payload)
-        return corrupted, detail
+        corrupted, detail = handler(dict(payload), context)
+        if not detail:
+            # Give the budget back so the plan still lands `max_per_run`
+            # real faults rather than silently spending one on a no-op.
+            self._injected_this_run -= 1
+            return payload, {}, False
+        return corrupted, detail, True
 
     def _raise_transport(self, fault: FaultSpec) -> None:
         messages = {
@@ -142,12 +178,12 @@ class FaultInjector:
 
     # -- structural ------------------------------------------------------
 
-    def _apply_malformed_json(self, payload, _doc):
+    def _apply_malformed_json(self, payload, _ctx):
         raw = json.dumps(payload)
         cut = self._rng.randint(len(raw) // 3, max(len(raw) // 3 + 1, len(raw) - 2))
         return {"__raw__": raw[:cut]}, {"truncated_at": cut, "original_len": len(raw)}
 
-    def _apply_schema_drift(self, payload, _doc):
+    def _apply_schema_drift(self, payload, _ctx):
         keys = [k for k in payload if not k.startswith("__")]
         if not keys:
             return payload, {}
@@ -156,10 +192,10 @@ class FaultInjector:
         payload[renamed] = payload.pop(victim)
         return payload, {"renamed": {victim: renamed}}
 
-    def _apply_type_violation(self, payload, _doc):
+    def _apply_type_violation(self, payload, _ctx):
         numeric = [
             k for k, v in payload.items()
-            if not k.startswith("__") and re.fullmatch(r"-?[\d,.]+", str(v) or "")
+            if not k.startswith("__") and re.fullmatch(r"-?[\d,.]+", str(v))
         ]
         if not numeric:
             return payload, {}
@@ -168,7 +204,7 @@ class FaultInjector:
         payload[victim] = f"approximately {original} (see attached schedule)"
         return payload, {"field": victim, "original": original}
 
-    def _apply_field_dropped(self, payload, _doc):
+    def _apply_field_dropped(self, payload, _ctx):
         keys = [k for k in payload if not k.startswith("__")]
         if not keys:
             return payload, {}
@@ -187,7 +223,7 @@ class FaultInjector:
                 out.append(k)
         return out
 
-    def _apply_digit_transposition(self, payload, _doc):
+    def _apply_digit_transposition(self, payload, _ctx):
         candidates = self._numeric_fields(payload)
         if not candidates:
             return payload, {}
@@ -204,9 +240,10 @@ class FaultInjector:
         else:
             chars[a], chars[b] = chars[b], chars[a]
         payload[victim] = "".join(chars)
-        return payload, {"field": victim, "original": original, "corrupted": payload[victim]}
+        return payload, {"field": victim, "original": original,
+                         "corrupted": payload[victim]}
 
-    def _apply_magnitude_shift(self, payload, _doc):
+    def _apply_magnitude_shift(self, payload, _ctx):
         candidates = self._numeric_fields(payload)
         if not candidates:
             return payload, {}
@@ -216,12 +253,13 @@ class FaultInjector:
             shifted = Decimal(str(original).replace(",", "")) * self._rng.choice(
                 [Decimal("10"), Decimal("0.1")]
             )
-        except Exception:
+        except (ArithmeticError, ValueError):
             return payload, {}
         payload[victim] = str(shifted.quantize(Decimal("0.01")))
-        return payload, {"field": victim, "original": original, "corrupted": payload[victim]}
+        return payload, {"field": victim, "original": original,
+                         "corrupted": payload[victim]}
 
-    def _apply_unit_mismatch(self, payload, _doc):
+    def _apply_unit_mismatch(self, payload, _ctx):
         if "currency" not in payload:
             return payload, {}
         original = payload["currency"]
@@ -230,14 +268,14 @@ class FaultInjector:
         return payload, {"field": "currency", "original": original,
                          "corrupted": payload["currency"]}
 
-    def _apply_plausible_substitution(self, payload, document_id):
+    def _apply_plausible_substitution(self, payload, ctx):
         """The dangerous one: swap in a value from another real document.
 
         Nothing about the resulting record is internally inconsistent. Only
         re-reading the source can catch it.
         """
         keys = [k for k in payload if not k.startswith("__") and k != "currency"]
-        others = [d for d in self.corpus if d.get("document_id") != document_id]
+        others = [d for d in self.corpus if d.get("document_id") != ctx.document_id]
         if not keys or not others:
             return payload, {}
         donor = self._rng.choice(others)
@@ -252,18 +290,31 @@ class FaultInjector:
 
     # -- contextual ------------------------------------------------------
 
-    def _apply_stale_cache(self, payload, document_id):
-        if not self._last_payloads:
-            return payload, {}
-        stale = dict(self._last_payloads[-1])
-        return stale, {"served_from": "previous_call"}
+    def _apply_stale_cache(self, payload, ctx):
+        """Serve this tool's result for an earlier document.
 
-    def _apply_cross_document_bleed(self, payload, document_id):
-        others = [d for d in self.corpus if d.get("document_id") != document_id]
+        Keyed by tool, so the shape of the response stays right and only its
+        *provenance* is wrong. Serving some other tool's payload — which an
+        earlier version did — drops half the expected fields and turns a
+        corroborative fault into one any schema check catches for free.
+        """
+        previous = self._last_served.get(ctx.tool_name)
+        if previous is None:
+            return payload, {}
+        served_for, stale = previous
+        if served_for == ctx.document_id or stale == payload:
+            return payload, {}
+        return dict(stale), {"served_for": served_for, "tool": ctx.tool_name}
+
+    def _apply_cross_document_bleed(self, payload, ctx):
+        others = [d for d in self.corpus if d.get("document_id") != ctx.document_id]
         if not others:
             return payload, {}
         donor = self._rng.choice(others)
-        keys = [k for k in payload if not k.startswith("__") and k in donor]
+        keys = [
+            k for k in payload
+            if not k.startswith("__") and k in donor and donor[k] != payload[k]
+        ]
         if not keys:
             return payload, {}
         n = max(1, len(keys) // 3)

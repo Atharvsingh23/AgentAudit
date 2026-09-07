@@ -66,9 +66,12 @@ class SourceGrep(Tool):
         text = document.get("raw_text", "")
         if not field_name:
             return {"__matches__": []}
-        pattern = field_name.replace("_", r"[\s_]*")
+        # \b on both ends, or a label search for "total" also matches inside
+        # "Subtotal" and returns the subtotal as the first hit — which the
+        # repair step then writes into the total field.
+        pattern = r"[\s_]*".join(re.escape(part) for part in field_name.split("_"))
         hits = re.findall(
-            rf"{pattern}\s*[:\-]?\s*([^\n]{{1,60}})", text, re.IGNORECASE
+            rf"\b{pattern}\b\s*[:\-]?\s*([^\n]{{1,60}})", text, re.IGNORECASE
         )
         return {"__matches__": [h.strip() for h in hits[:3]], "__field__": field_name}
 

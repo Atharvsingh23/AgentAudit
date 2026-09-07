@@ -15,13 +15,15 @@ import pytest
 
 from agentaudit import (
     INVOICE_CHECKS, INVOICE_SCHEMA, Condition, Criticality, DEFAULT_TOOLS,
-    Experiment, FaultInjector, InjectionPlan, MockProvider, Report,
-    SelfCorrectingAgent, ToolRegistry, build_corpus, corpus_for_injector,
-    score_run,
+    Experiment, ExtractionResult, FaultContext, FaultInjector, InjectionPlan,
+    MockProvider, Report, SelfCorrectingAgent, SpanKind, SpanStatus, Tool,
+    ToolFailure, ToolRegistry, Trace, build_corpus, corpus_for_injector,
+    format_table, score_run,
 )
 from agentaudit.faults.taxonomy import TAXONOMY, Detectability, FaultLayer
 from agentaudit.cli import DONOR_POOL, _documents, build_parser
 from agentaudit.schema import Field, FieldType, totals_add_up
+from agentaudit.tools.extraction import SourceGrep
 
 
 # -- schema ---------------------------------------------------------------
@@ -61,7 +63,8 @@ def test_validate_flags_missing_required_and_unknown_fields():
 
 
 def test_consistency_check_catches_broken_totals():
-    assert totals_add_up({"subtotal": "100.00", "tax": "10.00", "total": "110.00"}) is None
+    ok = {"subtotal": "100.00", "tax": "10.00", "total": "110.00"}
+    assert totals_add_up(ok) is None
     assert totals_add_up({"subtotal": "100.00", "tax": "10.00", "total": "999.00"})
 
 
@@ -395,3 +398,180 @@ def test_raw_text_is_consistent_with_fields():
     for doc in load_corpus()[:25]:
         for name, value in doc["fields"].items():
             assert str(value) in doc["raw_text"], f"{name} missing from raw_text"
+
+
+# -- measurement integrity ------------------------------------------------
+#
+# Each test below pins a bug that made the harness report something other
+# than what happened. They are grouped because they share a failure mode:
+# the numbers still looked plausible while they were wrong.
+
+def test_money_rejects_prose_wrapped_numbers():
+    """A lenient parser makes `type_violation` unmeasurable.
+
+    Stripping non-numeric characters turned the corrupted value straight
+    back into the correct one, so a MECHANICAL fault landed, passed
+    validation, and scored exact.
+    """
+    f = Field("total", FieldType.MONEY)
+    with pytest.raises(ValueError):
+        f.normalize("approximately 1234.50 (see attached schedule)")
+    # Currency-marked values from grep_source must still parse.
+    assert f.normalize("USD 1,234.50") == Decimal("1234.50")
+
+
+def test_integer_rejects_prose_but_accepts_integral_floats():
+    f = Field("line_item_count", FieldType.INTEGER)
+    with pytest.raises(ValueError):
+        f.normalize("approximately 7 (see attached schedule)")
+    with pytest.raises(ValueError):
+        f.normalize("12.7")
+    assert f.normalize("12.0") == 12
+
+
+def test_type_violation_is_detected_rather_than_absorbed():
+    docs = build_corpus(n=20, seed=7)
+    plan = InjectionPlan(rate=1.0, faults=("type_violation",), seed=0, max_per_run=1)
+    injector = FaultInjector(plan, corpus=corpus_for_injector(docs))
+    registry = ToolRegistry(DEFAULT_TOOLS, injector=injector)
+    agent = SelfCorrectingAgent(MockProvider(), registry, INVOICE_SCHEMA, INVOICE_CHECKS)
+    for doc in docs:
+        score = score_run(agent.run(doc), doc["truth"], INVOICE_SCHEMA)
+        if score.faults_injected:
+            assert score.faults_detected, f"{doc['document_id']}: type violation missed"
+            assert not score.lucky
+
+
+def test_grep_source_does_not_match_a_field_name_inside_another():
+    """`total` must not match inside `Subtotal`.
+
+    It did, and since repair takes the first hit, a run that flagged the
+    total wrote the *subtotal* into it — a wrong value produced by the
+    repair path itself.
+    """
+    doc = build_corpus(n=1, seed=7)[0]
+    grep = SourceGrep()
+    total = grep.run(doc, field="total")["__matches__"]
+    subtotal = grep.run(doc, field="subtotal")["__matches__"]
+    money = Field("m", FieldType.MONEY)
+    assert money.normalize(total[0]) == money.normalize(doc["fields"]["total"])
+    assert money.normalize(subtotal[0]) == money.normalize(doc["fields"]["subtotal"])
+    assert money.normalize(total[0]) != money.normalize(subtotal[0])
+
+
+def test_a_fault_that_corrupts_nothing_is_not_counted_as_injected():
+    """No donor documents means plausible_substitution has nothing to do.
+
+    Recording it anyway put runs where nothing was corrupted into the
+    denominator of every detection and silent-failure rate.
+    """
+    docs = build_corpus(n=3, seed=7)
+    plan = InjectionPlan(
+        rate=1.0, faults=("plausible_substitution",), seed=0, max_per_run=1)
+    injector = FaultInjector(plan, corpus=[])  # no donors
+    registry = ToolRegistry(DEFAULT_TOOLS, injector=injector)
+    agent = SelfCorrectingAgent(MockProvider(), registry, INVOICE_SCHEMA, INVOICE_CHECKS)
+    for doc in docs:
+        result = agent.run(doc)
+        assert result.trace.faults_injected == 0
+        assert score_run(result, doc["truth"], INVOICE_SCHEMA).exact_match
+
+
+def test_transport_retry_is_not_scored_as_detecting_a_corrupted_value():
+    """Retrying a timeout says nothing about noticing a transposed digit."""
+    trace = Trace(document_id="doc-000")
+    faulted = trace.span("extract_totals", SpanKind.TOOL)
+    faulted.fault_injected = "digit_transposition"
+    faulted.finish()
+    timed_out = trace.span("extract_header", SpanKind.TOOL)
+    timed_out.fault_injected = "timeout"
+    timed_out.finish(SpanStatus.ERROR)
+    retry = trace.span("retry:extract_header", SpanKind.CORRECTION,
+                       triggered_by=[timed_out.span_id], retry=True)
+    retry.finish()
+
+    result = ExtractionResult("doc-000", {}, trace)
+    score = score_run(result, {"total": "1.00"}, INVOICE_SCHEMA)
+    assert score.faults_injected == 1        # the timeout does not corrupt
+    assert score.faults_detected == 0
+    assert trace.repair_attempts == 0 and len(trace.retry_spans()) == 1
+
+
+def test_stale_cache_serves_the_same_tool_from_an_earlier_document():
+    """Serving another tool's payload would be a structural fault, not a
+    contextual one, and would be caught for free by any schema check."""
+    injector = FaultInjector(
+        InjectionPlan(rate=1.0, faults=("stale_cache",), seed=0))
+    injector.observe("extract_totals", "doc-000", {"total": "10.00"})
+    injector.observe("extract_header", "doc-000", {"vendor_name": "Acme"})
+
+    payload, detail, applied = injector.apply(
+        TAXONOMY["stale_cache"], {"total": "99.00"},
+        FaultContext("doc-001", "extract_totals"),
+    )
+    assert applied and payload == {"total": "10.00"}
+    assert detail["served_for"] == "doc-000"
+    assert set(payload) == {"total"}, "must keep the faulted tool's own shape"
+
+    # Nothing stale for a tool that has not run yet.
+    _, _, applied_again = injector.apply(
+        TAXONOMY["stale_cache"], {"line_item_count": 3},
+        FaultContext("doc-001", "count_line_items"),
+    )
+    assert not applied_again
+
+
+def test_judge_rescues_a_field_without_writing_truth_into_the_record():
+    docs = build_corpus(n=1, seed=7)
+    doc = docs[0]
+    registry = ToolRegistry(DEFAULT_TOOLS, injector=FaultInjector(InjectionPlan()))
+    agent = SelfCorrectingAgent(MockProvider(), registry, INVOICE_SCHEMA, INVOICE_CHECKS)
+    result = agent.run(doc)
+    result.record["vendor_name"] = "Acme Ltd"
+
+    score = score_run(result, doc["truth"], INVOICE_SCHEMA, rescued={"vendor_name"})
+    assert score.exact_match
+    assert result.record["vendor_name"] == "Acme Ltd", "ground truth leaked into output"
+
+
+def test_corroborated_fields_are_counted_once_per_run():
+    docs = build_corpus(n=8, seed=7)
+    plan = InjectionPlan(rate=1.0, faults=("magnitude_shift",), seed=0, max_per_run=1)
+    injector = FaultInjector(plan, corpus=corpus_for_injector(docs))
+    registry = ToolRegistry(DEFAULT_TOOLS, injector=injector)
+    agent = SelfCorrectingAgent(MockProvider(), registry, INVOICE_SCHEMA, INVOICE_CHECKS)
+    for doc in docs:
+        fields = agent.run(doc).corroborated_fields
+        assert len(fields) == len(set(fields))
+
+
+def test_a_tool_that_raises_leaves_no_span_open():
+    """An unclosed span reparents everything that follows it."""
+    class Exploding(Tool):
+        name = "extract_header"
+        description = "always fails"
+
+        def run(self, document, **kwargs):
+            raise ToolFailure("timeout", "boom", retryable=False)
+
+    trace = Trace(document_id="doc-000")
+    outer = trace.span("extract", SpanKind.AGENT)
+    trace.push(outer)
+    registry = ToolRegistry([Exploding()])
+    with pytest.raises(ToolFailure):
+        registry.call("extract_header", {"document_id": "doc-000"}, trace)
+
+    later = trace.span("assemble", SpanKind.MODEL)
+    assert later.parent_id == outer.span_id
+    tool_spans = trace.tool_spans()
+    assert tool_spans and all(s.end is not None for s in tool_spans)
+
+
+def test_format_table_keeps_columns_aligned_for_long_condition_names():
+    reports = [Report(condition="clean"),
+               Report(condition="semantic+contextual+something+long")]
+    for report in reports:
+        report.runs.append(score_run(
+            ExtractionResult("doc-000", {}, Trace()), {}, INVOICE_SCHEMA))
+    rows = format_table(reports).splitlines()
+    assert len({len(r) for r in rows}) == 1, "a long name pushed a row out of line"

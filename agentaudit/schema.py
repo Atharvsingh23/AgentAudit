@@ -21,6 +21,30 @@ from typing import Any, Callable
 #       Decision: stick with dataclass for now because the overhead of TypedDict maintenance
 #       isn't justified until we see actual schema deserialization bugs in CI.
 
+# Numeric parsing is deliberately strict.
+#
+# An earlier version stripped every non-numeric character before parsing, so
+# "approximately 1234.50 (see attached schedule)" parsed cleanly as 1234.50.
+# That made `type_violation` — a fault the taxonomy calls MECHANICAL, i.e.
+# catchable by a type check alone — completely inert: it landed, validation
+# passed, and the run scored exact. A lenient parser in the scorer silently
+# repairs the corruption the harness exists to measure.
+#
+# Currency markers and thousands separators are still accepted, because tools
+# legitimately return "USD 1,234.50" when they re-read the source document.
+_CURRENCY = "USD|EUR|GBP|INR|[$€£₹]"
+_LEADING_CURRENCY = re.compile(rf"^(?:{_CURRENCY})", re.IGNORECASE)
+_TRAILING_CURRENCY = re.compile(rf"(?:{_CURRENCY})$", re.IGNORECASE)
+_DECIMAL_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_INTEGER_RE = re.compile(r"(-?\d+)(?:\.0+)?")
+
+
+def _strip_currency(text: str) -> str:
+    """Remove whitespace, thousands separators and one currency marker."""
+    cleaned = re.sub(r"[\s,_]", "", text)
+    cleaned = _LEADING_CURRENCY.sub("", cleaned, count=1)
+    return _TRAILING_CURRENCY.sub("", cleaned, count=1)
+
 
 class FieldType(str, Enum):
     STRING = "string"
@@ -62,8 +86,8 @@ class Field:
             raise ValueError("value is None")
 
         if self.type is FieldType.MONEY:
-            cleaned = re.sub(r"[^\d.\-]", "", str(value))
-            if not cleaned or cleaned in {"-", ".", "-."}:
+            cleaned = _strip_currency(str(value))
+            if not _DECIMAL_RE.fullmatch(cleaned):
                 raise ValueError(f"cannot parse money from {value!r}")
             try:
                 return Decimal(cleaned).quantize(Decimal("0.01"))
@@ -71,10 +95,11 @@ class Field:
                 raise ValueError(f"cannot parse money from {value!r}") from exc
 
         if self.type is FieldType.INTEGER:
-            cleaned = re.sub(r"[^\d\-]", "", str(value))
-            if not cleaned or cleaned == "-":
+            cleaned = re.sub(r"[\s,_]", "", str(value))
+            match = _INTEGER_RE.fullmatch(cleaned)
+            if match is None:
                 raise ValueError(f"cannot parse integer from {value!r}")
-            return int(cleaned)
+            return int(match.group(1))
 
         if self.type is FieldType.DATE:
             if isinstance(value, datetime):
@@ -180,12 +205,18 @@ class Schema:
 ConsistencyCheck = Callable[[dict[str, Any]], str | None]
 
 
+_MONEY_FIELD = Field("money", FieldType.MONEY)
+_DATE_FIELD = Field("date", FieldType.DATE)
+
+
 def totals_add_up(record: dict[str, Any]) -> str | None:
     try:
-        subtotal = Decimal(re.sub(r"[^\d.\-]", "", str(record["subtotal"])))
-        tax = Decimal(re.sub(r"[^\d.\-]", "", str(record["tax"])))
-        total = Decimal(re.sub(r"[^\d.\-]", "", str(record["total"])))
-    except (KeyError, TypeError, InvalidOperation):
+        subtotal = _MONEY_FIELD.normalize(record["subtotal"])
+        tax = _MONEY_FIELD.normalize(record["tax"])
+        total = _MONEY_FIELD.normalize(record["total"])
+    except (KeyError, TypeError, ValueError):
+        # Unparseable values are schema validation's problem, not this
+        # check's — reporting them in both places double-counts one fault.
         return None
     if abs((subtotal + tax) - total) > Decimal("0.02"):
         return f"subtotal ({subtotal}) + tax ({tax}) != total ({total})"
@@ -197,9 +228,8 @@ def due_after_issue(record: dict[str, Any]) -> str | None:
     due = record.get("due_date")
     if not issue or not due:
         return None
-    field_ = Field("d", FieldType.DATE)
     try:
-        if field_.normalize(due) < field_.normalize(issue):
+        if _DATE_FIELD.normalize(due) < _DATE_FIELD.normalize(issue):
             return f"due_date ({due}) precedes issue_date ({issue})"
     except (ValueError, TypeError):
         return None

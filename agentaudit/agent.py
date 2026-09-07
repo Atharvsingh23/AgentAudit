@@ -19,7 +19,7 @@ from typing import Any
 
 from .faults.injector import ToolFailure
 from .providers.base import Provider
-from .schema import ConsistencyCheck, Schema
+from .schema import ConsistencyCheck, Field, Schema
 from .tools.base import ToolRegistry
 from .trace import SpanKind, SpanStatus, Trace
 
@@ -97,14 +97,17 @@ class SelfCorrectingAgent:
     ) -> tuple[dict[str, Any], list[str]]:
         evidence, failed_tools = self._gather(document, trace)
         record = self._assemble(evidence, trace)
-        corroborated: list[str] = []
+        # Ordered set: a field re-checked on two correction rounds was still
+        # only corroborated once, and counting it twice overstates the cost
+        # of the defence the ablation is pricing.
+        corroborated: dict[str, None] = {}
 
         for attempt in range(self.max_corrections + 1):
             problems, culprit_spans = self._diagnose(record, trace)
 
             if self.corroborate and not problems:
                 extra, checked = self._corroborate(record, document, trace)
-                corroborated.extend(checked)
+                corroborated.update(dict.fromkeys(checked))
                 if extra:
                     problems.extend(extra[0])
                     culprit_spans.extend(extra[1])
@@ -120,7 +123,7 @@ class SelfCorrectingAgent:
 
         if failed_tools:
             trace.metadata["failed_tools"] = failed_tools
-        return record, corroborated
+        return record, list(corroborated)
 
     def _gather(
         self, document: dict[str, Any], trace: Trace
@@ -318,7 +321,7 @@ class SelfCorrectingAgent:
 
         return {k: v for k, v in repaired.items() if self.schema.get(k) is not None}
 
-    def _field_from_problem(self, problem: str):
+    def _field_from_problem(self, problem: str) -> Field | None:
         """Resolve which field a validation message refers to.
 
         Messages come in two shapes — "field: reason" and "missing required

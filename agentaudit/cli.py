@@ -23,7 +23,9 @@ from .faults.injector import FaultInjector, InjectionPlan
 from .faults.taxonomy import TAXONOMY
 from .metrics import format_table, score_run
 from .providers.mock import MockProvider
-from .runner import Experiment, ablation_conditions, standard_conditions
+from .runner import (
+    Experiment, ablation_conditions, by_fault_conditions, standard_conditions,
+)
 from .schema import INVOICE_CHECKS, INVOICE_SCHEMA
 
 
@@ -81,11 +83,12 @@ def cmd_bench(args: argparse.Namespace) -> int:
         max_corrections=args.max_corrections,
         use_judge=not args.no_judge,
     )
-    conditions = (
-        ablation_conditions(seed=args.seed, rate=args.rate)
-        if args.ablation
-        else standard_conditions(seed=args.seed, rate=args.rate)
-    )
+    if args.ablation:
+        conditions = ablation_conditions(seed=args.seed, rate=args.rate)
+    elif args.by_fault:
+        conditions = by_fault_conditions(seed=args.seed, rate=args.rate)
+    else:
+        conditions = standard_conditions(seed=args.seed, rate=args.rate)
 
     result = experiment.run(conditions)
 
@@ -182,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--no-corroborate", action="store_true")
     bench.add_argument("--no-judge", action="store_true")
     bench.add_argument("--ablation", action="store_true")
+    bench.add_argument("--by-fault", action="store_true",
+                       help="one condition per fault instead of per layer")
     bench.add_argument("--generate", action="store_true",
                        help="regenerate the corpus instead of loading benchmarks/")
     bench.add_argument("--out")

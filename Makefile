@@ -24,6 +24,7 @@ ablation:
 
 results:
 	agentaudit bench --n 100 --out results/standard.json
+	agentaudit bench --n 100 --by-fault --out results/by_fault.json
 	agentaudit bench --n 100 --ablation --out results/ablation_on.json
 	agentaudit bench --n 100 --ablation --no-corroborate --out results/ablation_off.json
 
